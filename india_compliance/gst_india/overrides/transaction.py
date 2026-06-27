@@ -392,6 +392,20 @@ class GSTAccounts:
         if not party_gstin or self.doc.company_gstin != party_gstin:
             return
 
+        # Allow GST on internal supplier transactions. A purchase from a supplier
+        # flagged "Is Internal Supplier" is a same-GSTIN internal transfer that is,
+        # by requirement here, charged GST (see set_tax_template_if_missing).
+        if not self.is_sales_transaction and (
+            self.doc.get("is_internal_supplier")
+            or (
+                self.doc.get("supplier")
+                and frappe.db.get_value(
+                    "Supplier", self.doc.supplier, "is_internal_supplier"
+                )
+            )
+        ):
+            return
+
         self._throw(
             _(
                 "Cannot charge GST in Row #{0} since Company GSTIN and Party GSTIN are"
@@ -1795,6 +1809,51 @@ def before_validate_transaction(doc, method=None):
         doc.place_of_supply = get_place_of_supply(doc, doc.doctype)
 
     set_reverse_charge_as_per_gst_settings(doc)
+
+    set_tax_template_if_missing(doc)
+
+
+def set_tax_template_if_missing(doc):
+    """Apply the GST tax template for internal supplier transactions only.
+
+    A supplier flagged "Is Internal Supplier" represents another company in the
+    same group, so the purchase is a same-GSTIN internal transfer. India
+    Compliance treats that as no-GST and never sets a template (the template is
+    fetched and then cleared on the form). Per requirement, for these
+    transactions only, fetch the category-based GST template automatically.
+    Regular (external) supplier transactions are left completely untouched.
+    """
+    supplier = doc.get("supplier")
+    if not supplier:
+        return
+
+    # is_internal_supplier on the doc is fetched during validate (after this
+    # hook runs), so read it from the supplier master to be reliable.
+    is_internal_supplier = doc.get("is_internal_supplier") or frappe.db.get_value(
+        "Supplier", supplier, "is_internal_supplier"
+    )
+    if not is_internal_supplier:
+        return
+
+    # Never override an explicit choice / existing taxes
+    if doc.get("taxes_and_charges") or doc.get("taxes"):
+        return
+
+    tax_category = doc.get("tax_category") or frappe.db.get_value(
+        "Supplier", supplier, "tax_category"
+    )
+    if not tax_category:
+        return
+
+    master_doctype = "Purchase Taxes and Charges Template"
+    template = get_tax_template_based_on_category(
+        master_doctype, doc.company, frappe._dict(tax_category=tax_category)
+    )
+    if not template:
+        return
+
+    doc.taxes_and_charges = template
+    doc.set("taxes", get_taxes_and_charges(master_doctype, template))
 
 
 def validate_transaction(doc, method=None):
